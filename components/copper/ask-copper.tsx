@@ -14,7 +14,8 @@ import {
   WrenchIcon,
   XIcon,
 } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { Fragment, type ReactNode, useEffect, useRef, useState } from "react";
+import { RefundStatusPill } from "@/components/copper/refund-status";
 import { SetupRequired } from "@/components/setup-required";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,12 +31,20 @@ import { readLive } from "@/lib/ai/live";
 import { askCopper, type ChatMessage } from "@/lib/copper/assistant/ask";
 import { splitCitations } from "@/lib/copper/assistant/citations";
 import {
+  AGENT_NAMES,
+  AGENT_TOOLS,
+  type AgentId,
+  HANDOFFS,
   type Progress,
   type ToolStep,
   TOOL_LABELS,
 } from "@/lib/copper/assistant/progress";
 import { formatUsd, getPlans, getProducts } from "@/lib/copper/catalog";
+import { REFUNDS_CHANGED } from "@/lib/copper/refunds";
 import { cn } from "@/lib/utils";
+
+/** The tools that can change what the Refund Console shows. */
+const REFUND_CHANGERS = ["request_refund"];
 
 const STARTERS = [
   "How much is Copper Home with Copper Plus, paid yearly, for 2 years?",
@@ -43,10 +52,16 @@ const STARTERS = [
   "Is Copper Plus cheaper monthly or yearly?",
 ];
 
-type Turn = { question: string; progress: Progress };
+/** `agent` is who the question went to: whoever answered the turn before. */
+type Turn = { question: string; progress: Progress; agent: AgentId };
 type Chats = { tools: Turn[]; noTools: Turn[] };
 
-const WORKING: Progress = { steps: [], reply: "", status: "working" };
+const working = (agent: AgentId): Progress => ({
+  steps: [],
+  reply: "",
+  status: "working",
+  agent,
+});
 
 export function AskCopper({
   aiConfigured,
@@ -92,6 +107,10 @@ export function AskCopper({
     setDraft("");
     const chat = key;
     const index = turns.length;
+    // Whoever answered last answers next: after a hand-off, the customer
+    // keeps talking to the Refund agent until it hands them back.
+    const agent: AgentId =
+      chat === "tools" ? (turns.at(-1)?.progress.agent ?? "copper") : "copper";
     // Only finished turns go to the model: questions and Copper's replies.
     const messages: ChatMessage[] = [
       ...turns.flatMap(({ question, progress }): ChatMessage[] => [
@@ -109,19 +128,32 @@ export function AskCopper({
       }));
     setChats((all) => ({
       ...all,
-      [chat]: [...all[chat], { question, progress: WORKING }],
+      [chat]: [...all[chat], { question, progress: working(agent), agent }],
     }));
     try {
       const { progress } = await askCopper({
         messages,
         useTools: chat === "tools",
+        ...(agent !== "copper" && { agent }),
       });
-      for await (const update of readLive(progress)) setProgress(update);
+      let last: Progress | undefined;
+      for await (const update of readLive(progress)) {
+        setProgress(update);
+        last = update;
+      }
+      // A refund may have changed: tell the Refund Console beside the chat.
+      if (
+        last?.steps.some(
+          (s) => s.type === "tool" && REFUND_CHANGERS.includes(s.name),
+        )
+      )
+        window.dispatchEvent(new Event(REFUNDS_CHANGED));
     } catch {
       setProgress({
         steps: [],
         reply: "Sorry, I couldn't reach Copper. Please try again.",
         status: "error",
+        agent,
       });
     }
   }
@@ -157,7 +189,7 @@ export function AskCopper({
                   Ask Copper
                 </SheetTitle>
                 <SheetDescription className="text-xs text-white/70">
-                  Prices, totals and stock, checked with tools.
+                  Copper answers; the Refund agent handles refunds.
                 </SheetDescription>
               </div>
               <SheetClose asChild>
@@ -199,7 +231,11 @@ export function AskCopper({
                     <p className="bg-primary text-primary-foreground ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2">
                       {turn.question}
                     </p>
-                    <Answer progress={turn.progress} useTools={useTools} />
+                    <Answer
+                      progress={turn.progress}
+                      useTools={useTools}
+                      agent={turn.agent ?? "copper"}
+                    />
                   </div>
                 ))}
                 {!busy && (
@@ -259,19 +295,63 @@ export function AskCopper({
   );
 }
 
-/** One answer: the rail of stations, then Copper's reply. */
+/** The tools one agent can use, the ones it used this answer highlighted. */
+function ToolList({
+  agent,
+  useTools,
+  used,
+}: {
+  agent: AgentId;
+  useTools: boolean;
+  used: Set<string>;
+}) {
+  const names = useTools
+    ? AGENT_TOOLS[agent]
+    : Object.keys(TOOL_LABELS).filter((n) => AGENT_TOOLS.copper.includes(n));
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {names.map((name) => (
+        <span
+          key={name}
+          className={cn(
+            "rounded-md px-2 py-0.5 font-mono text-xs",
+            !useTools && "text-muted-foreground bg-background line-through",
+            useTools && used.has(name) && "bg-accent font-bold text-white",
+            useTools &&
+              !used.has(name) &&
+              "bg-background text-muted-foreground",
+          )}
+        >
+          {name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** One answer: the rail of stations, then the agent's reply. */
 function Answer({
   progress,
   useTools,
+  agent: firstAgent,
 }: {
   progress: Progress;
   useTools: boolean;
+  /** Who the question went to (the reply may come from the other agent). */
+  agent: AgentId;
 }) {
   const { steps, reply, status } = progress;
-  const used = new Set(
-    steps.filter((s): s is ToolStep => s.type === "tool").map((s) => s.name),
-  );
+  const usedBy = (agent: AgentId) =>
+    new Set(
+      steps
+        .filter(
+          (s): s is ToolStep =>
+            s.type === "tool" && (s.agent ?? "copper") === agent,
+        )
+        .map((s) => s.name),
+    );
   const working = status === "working";
+  const replier = AGENT_NAMES[progress.agent ?? firstAgent];
   let toolCount = 0;
   return (
     <div className="space-y-3">
@@ -289,29 +369,16 @@ function Answer({
           node={<WrenchIcon className="size-3" />}
           nodeClass="bg-muted-foreground"
           label={
-            useTools ? "Tools Copper can use" : "Tools given to Copper: none"
+            useTools
+              ? `Tools ${AGENT_NAMES[firstAgent]} can use`
+              : "Tools given to Copper: none"
           }
         >
-          <div className="flex flex-wrap gap-1.5">
-            {Object.keys(TOOL_LABELS).map((name) => (
-              <span
-                key={name}
-                className={cn(
-                  "rounded-md px-2 py-0.5 font-mono text-xs",
-                  !useTools &&
-                    "text-muted-foreground bg-background line-through",
-                  useTools &&
-                    used.has(name) &&
-                    "bg-accent font-bold text-white",
-                  useTools &&
-                    !used.has(name) &&
-                    "bg-background text-muted-foreground",
-                )}
-              >
-                {name}
-              </span>
-            ))}
-          </div>
+          <ToolList
+            agent={firstAgent}
+            useTools={useTools}
+            used={usedBy(firstAgent)}
+          />
           {!useTools && (
             <p className="text-muted-foreground mt-1.5 text-xs">
               Copper has to answer from memory alone.
@@ -319,36 +386,56 @@ function Answer({
           )}
         </Station>
 
-        {steps.map((step, i) =>
-          step.type === "thinking" ? (
-            <Station
-              key={i}
-              node={<BrainIcon className="size-3" />}
-              nodeClass={useTools ? "bg-primary" : "bg-chart-3"}
-              label="Copper is thinking"
-            >
-              <p
-                data-testid="thinking"
-                className="text-muted-foreground border-l-2 pl-3 text-sm whitespace-pre-wrap italic"
+        {steps.map((step, i) => {
+          const who = AGENT_NAMES[step.agent ?? "copper"];
+          if (step.type === "thinking")
+            return (
+              <Station
+                key={i}
+                node={<BrainIcon className="size-3" />}
+                nodeClass={useTools ? "bg-primary" : "bg-chart-3"}
+                label={`${who} is thinking`}
               >
-                <InlineMarkdown text={step.text} />
-              </p>
-            </Station>
-          ) : (
-            <Station
-              key={i}
-              node={<WrenchIcon className="size-3" />}
-              nodeClass="bg-accent"
-              label={
-                step.state === "calling"
-                  ? "Copper is calling a tool"
-                  : "Copper called a tool"
-              }
-            >
-              <ToolCard step={step} number={++toolCount} />
-            </Station>
-          ),
-        )}
+                <p
+                  data-testid="thinking"
+                  className="text-muted-foreground border-l-2 pl-3 text-sm whitespace-pre-wrap italic"
+                >
+                  <InlineMarkdown text={step.text} />
+                </p>
+              </Station>
+            );
+          const handedTo = step.state === "done" && HANDOFFS[step.name];
+          return (
+            <Fragment key={i}>
+              <Station
+                node={<WrenchIcon className="size-3" />}
+                nodeClass="bg-accent"
+                label={
+                  step.state === "calling"
+                    ? `${who} is calling a tool`
+                    : `${who} called a tool`
+                }
+              >
+                <ToolCard step={step} number={++toolCount} who={who} />
+              </Station>
+              {handedTo && (
+                <Station
+                  node={<ArrowRightIcon className="size-3" />}
+                  nodeClass="bg-primary"
+                  label={`Now talking: ${AGENT_NAMES[handedTo]}`}
+                >
+                  <div data-testid="handoff" data-agent={handedTo}>
+                    <ToolList
+                      agent={handedTo}
+                      useTools={useTools}
+                      used={usedBy(handedTo)}
+                    />
+                  </div>
+                </Station>
+              )}
+            </Fragment>
+          );
+        })}
 
         {working && (
           <div className="relative">
@@ -376,7 +463,12 @@ function Answer({
 
       {(reply || !working) && (
         <div className="bg-card ml-2 rounded-2xl rounded-tl-sm border p-4 shadow-xs">
-          <p className="text-primary mb-1 text-xs font-bold">Copper</p>
+          <p
+            data-testid="reply-from"
+            className="text-primary mb-1 text-xs font-bold"
+          >
+            {replier}
+          </p>
           {!useTools && (
             <div className="border-chart-3 bg-chart-3/10 mb-3 rounded-lg border p-3 text-xs">
               <p className="flex items-center gap-1.5 font-bold">
@@ -470,7 +562,15 @@ function InlineMarkdown({ text }: { text: string }) {
   });
 }
 
-function ToolCard({ step, number }: { step: ToolStep; number: number }) {
+function ToolCard({
+  step,
+  number,
+  who,
+}: {
+  step: ToolStep;
+  number: number;
+  who: string;
+}) {
   return (
     <div
       data-testid="tool-call"
@@ -488,7 +588,7 @@ function ToolCard({ step, number }: { step: ToolStep; number: number }) {
       </div>
       <div className="space-y-2 px-3 py-3">
         <p className="text-muted-foreground flex items-center gap-1 text-[11px] font-semibold tracking-widest uppercase">
-          <ArrowRightIcon className="size-3" /> What Copper sent
+          <ArrowRightIcon className="size-3" /> What {who} sent
         </p>
         {step.input === undefined ? (
           <p className="text-muted-foreground text-xs italic">
@@ -656,12 +756,77 @@ function ToolOutput({ name, output }: { name: string; output: any }) {
         ))}
       </ol>
     );
+  if (name in HANDOFFS && output?.transferred)
+    return <p className="text-xs">Handed the chat to the {output.to}.</p>;
+  if (
+    ["lookup_order", "request_refund", "check_refund_status"].includes(name) &&
+    output?.status
+  )
+    return <RefundOutput output={output} />;
   // A tool without its own layout yet: show what came back as plain text.
   return (
     <pre className="max-h-48 overflow-auto text-xs whitespace-pre-wrap">
       {typeof output === "string" ? output : JSON.stringify(output, null, 2)}
     </pre>
   );
+}
+/** One order line: number, item, amount and refund status. */
+function OrderLine({ order, status }: { order: any; status: any }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-muted-foreground font-mono">#{order.orderId}</span>
+      <span className="min-w-0 flex-1 truncate">{order.item}</span>
+      {status && <RefundStatusPill status={status} />}
+      {order.amountUsd !== undefined && (
+        <span className="font-mono">{formatUsd(order.amountUsd)}</span>
+      )}
+    </div>
+  );
+}
+
+/** What lookup_order, request_refund and check_refund_status sent back. */
+function RefundOutput({ output }: { output: any }) {
+  switch (output.status) {
+    case "ok":
+      return (
+        <div className="space-y-1 text-xs">
+          {output.orders ? (
+            output.orders.map((o: any) => (
+              <OrderLine key={o.orderId} order={o} status={o.refundStatus} />
+            ))
+          ) : (
+            <OrderLine order={output} status={output.refundStatus} />
+          )}
+        </div>
+      );
+    case "refunded_auto":
+    case "waiting":
+      return (
+        <div className="space-y-1.5 text-xs">
+          <OrderLine order={output} status={output.status} />
+          <p className="text-muted-foreground">
+            {`${formatUsd(output.amountUsd)} is ${
+              output.status === "refunded_auto" ? "within" : "over"
+            } the ${formatUsd(output.limitUsd)} auto-refund limit.`}
+          </p>
+        </div>
+      );
+    case "already_requested":
+      return (
+        <div className="space-y-1.5 text-xs">
+          <OrderLine order={output} status={output.refundStatus} />
+          <p className="text-muted-foreground">
+            This order already has a refund, so the app refused a second one.
+          </p>
+        </div>
+      );
+    case "not_found":
+      return (
+        <p className="text-xs">No order #{output.orderId} for this customer.</p>
+      );
+    default:
+      return <p className="text-xs">{output.message ?? output.status}</p>;
+  }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
