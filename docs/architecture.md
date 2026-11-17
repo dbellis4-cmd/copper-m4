@@ -139,3 +139,48 @@ second agent, and a person approving the large ones.
 |---|---|---|
 | Page | `app/support/page.tsx` | The "Refund Console" title and nothing else yet, linked from the header as Support |
 | Chat panel | `components/copper/ask-copper.tsx` | With the `docked` prop it starts open and the page beside it stays clickable. It is the same single agent and tools as on the home page |
+
+## Module 4: Refund agent and Refund Console
+
+**Summary:** Copper hands refund requests to a second agent, the Refund agent,
+with its own instructions and tools. The app (not the model) compares the
+order amount with an auto-refund limit: at or under it, the refund goes
+through; over it, it waits for a person to Approve or Reject in the Refund
+Console on `/support`. The spec is `specs/module-4/spec.md`.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Page | `app/support/page.tsx` | The Refund Console beside the docked chat. Shows `<SetupRequired service="refunds" />` when the Supabase variables aren't set. No login: this is a demo |
+| Components | `components/copper/refund-console.tsx`, `components/copper/refund-status.tsx` | The limit box, "Waiting for your approval" with Approve/Reject, the demo customer's orders with a status pill, and Reset demo. Loads in the browser and reloads when the chat fires `REFUNDS_CHANGED` or the tab regains focus |
+| Server Actions | `lib/copper/refund-console.ts` | `loadConsole`, `decideRefund`, `saveLimit`, `resetDemo`. Each returns the fresh view. The only way to approve or reject a refund |
+| Refund rules | `lib/copper/refunds.ts` | `requestRefund()`: amount from the order, never the chat; at or under the limit → `refunded_auto`, over → `waiting`; one refund per order; only the demo customer's orders. Also `lookupOrder`, `checkRefundStatus`, `decideWaitingRefund`, `setRefundLimit` (0 to 10,000), `consoleView` |
+| Data | `supabase/migrations/20261117000000_refunds.sql`, `lib/copper/refund-store.ts` | Tables `orders` (Maya Reyes's 4 orders), `refunds` (unique per order) and `refund_settings` (one row: the limit, default $50). Row-level security lets anyone read and nobody write; the server writes with `SUPABASE_SECRET_KEY` via `createSecretClient()` |
+| Agents and tools | `lib/copper/assistant/ask.ts`, `refund-tools.ts`, `instructions.ts`, `progress.ts` | Copper gains `transfer_to_refund_agent`. The Refund agent has `REFUND_INSTRUCTIONS` and `lookup_order`, `request_refund`, `check_refund_status`, `search_docs`, `transfer_back_to_copper`. A hand-off tool stops the current agent (`hasToolCall`) and the other one answers the same question; at most 2 hand-offs per question. `Progress.agent` says who answered, and the chat sends it back as `agent` with the next question |
+| Chat panel | `components/copper/ask-copper.tsx` | Labels each step and the reply with its agent, shows a "Now talking: Refund agent" station with that agent's tools, and draws refund results with the status pill |
+| AI calls | `{ module: 2, feature: "ask-copper" }`, `{ module: 4, feature: "refund-agent" }` | One streamed call per agent per question, so a hand-off logs two rows. A refund question takes 2–4 model requests |
+
+**Data flow:** customer asks for a refund → Copper calls
+`transfer_to_refund_agent` → Refund agent calls `request_refund(orderId)` →
+`requestRefund()` reads the order and the limit from Supabase and saves a
+refund as `refunded_auto` or `waiting` → the chat fires `REFUNDS_CHANGED` and
+the console reloads → a person clicks Approve or Reject → `decideRefund()`
+updates the row (only if still waiting) → the customer asks again and
+`check_refund_status` reports it.
+
+**Decisions and trade-offs:** The rule is code, not instructions, so the model
+can't be talked past it: `request_refund` takes only an order number, and no
+tool can approve. Supabase instead of memory, so refunds survive restarts and
+deploys; the secret key stays on the server (no `NEXT_PUBLIC_` prefix). A
+unique `order_id` blocks a second refund for an order even if two requests
+arrive at once. The console loads in the browser rather than on the server so
+the page never waits on the database. One demo customer and no login keep the
+demo simple.
+
+**Risks and open questions:** Anyone who opens `/support` can approve refunds
+or change the limit: fine for a demo, not for production (needs login and
+roles). The free Google key allows 20 requests a day, and a full demo uses
+about 10; when it runs out the chat says "Sorry" and the terminal logs
+`[ask-copper] ... failed:` with Google's reason. Free keys can't use Gemini
+2.5 Flash, so set `AI_MODEL=google/gemini-3-flash` locally and on Vercel. Not
+yet handled: partial refunds, return windows (30 days for devices; Copper Plus
+terms), and cancelling a waiting request.
