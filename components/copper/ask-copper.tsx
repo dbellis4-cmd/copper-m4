@@ -40,7 +40,12 @@ import {
   TOOL_LABELS,
 } from "@/lib/copper/assistant/progress";
 import { formatUsd, getPlans, getProducts } from "@/lib/copper/catalog";
-import { REFUNDS_CHANGED } from "@/lib/copper/refunds";
+import {
+  decisionNotice,
+  REFUND_DECIDED,
+  type RefundDecision,
+  REFUNDS_CHANGED,
+} from "@/lib/copper/refunds";
 import { cn } from "@/lib/utils";
 
 /** The tools that can change what the Refund Console shows. */
@@ -52,8 +57,17 @@ const STARTERS = [
   "Is Copper Plus cheaper monthly or yearly?",
 ];
 
-/** `agent` is who the question went to: whoever answered the turn before. */
-type Turn = { question: string; progress: Progress; agent: AgentId };
+/**
+ * `agent` is who the question went to: whoever answered the turn before.
+ * A `notice` turn has no question: it's the Refund agent telling the customer
+ * that a person approved or rejected their refund in the Refund Console.
+ */
+type Turn = {
+  question: string;
+  progress: Progress;
+  agent: AgentId;
+  notice?: boolean;
+};
 type Chats = { tools: Turn[]; noTools: Turn[] };
 
 const working = (agent: AgentId): Progress => ({
@@ -79,7 +93,33 @@ export function AskCopper({
 
   const key = useTools ? "tools" : "noTools";
   const turns = chats[key];
-  const busy = turns.at(-1)?.progress.status === "working";
+  // Any turn still working (a notice can land after a question that's still
+  // being answered).
+  const busy = turns.some((turn) => turn.progress.status === "working");
+
+  // When a person approves or rejects a refund in the Refund Console beside
+  // the chat, the Refund agent tells the customer straight away. The message
+  // is written by code from the database's answer, so it uses no AI request.
+  useEffect(() => {
+    const onDecided = (event: Event) => {
+      const decision = (event as CustomEvent<RefundDecision>).detail;
+      if (!decision) return;
+      const notice: Turn = {
+        question: "",
+        notice: true,
+        agent: "refund",
+        progress: {
+          steps: [],
+          reply: decisionNotice(decision),
+          status: "done",
+          agent: "refund",
+        },
+      };
+      setChats((all) => ({ ...all, tools: [...all.tools, notice] }));
+    };
+    window.addEventListener(REFUND_DECIDED, onDecided);
+    return () => window.removeEventListener(REFUND_DECIDED, onDecided);
+  }, []);
 
   // Open from the header's #ask link or a page load at /#ask. Clicking the
   // link again fires no hashchange, so listen for the click too.
@@ -111,14 +151,15 @@ export function AskCopper({
     // keeps talking to the Refund agent until it hands them back.
     const agent: AgentId =
       chat === "tools" ? (turns.at(-1)?.progress.agent ?? "copper") : "copper";
-    // Only finished turns go to the model: questions and Copper's replies.
-    const messages: ChatMessage[] = [
-      ...turns.flatMap(({ question, progress }): ChatMessage[] => [
-        { role: "user", content: question },
+    // Only finished turns go to the model: questions and the agents' replies.
+    // A notice has no question, so it goes as the agent's message alone.
+    const messages = tidyHistory([
+      ...turns.flatMap(({ question, progress, notice }): ChatMessage[] => [
+        ...(notice ? [] : [{ role: "user" as const, content: question }]),
         { role: "assistant", content: progress.reply },
       ]),
       { role: "user", content: question },
-    ];
+    ]);
     const setProgress = (progress: Progress) =>
       setChats((all) => ({
         ...all,
@@ -226,18 +267,22 @@ export function AskCopper({
                 ref={body}
                 className="bg-secondary flex-1 space-y-6 overflow-y-auto px-4 py-5"
               >
-                {turns.map((turn, i) => (
-                  <div key={i} className="space-y-4">
-                    <p className="bg-primary text-primary-foreground ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2">
-                      {turn.question}
-                    </p>
-                    <Answer
-                      progress={turn.progress}
-                      useTools={useTools}
-                      agent={turn.agent ?? "copper"}
-                    />
-                  </div>
-                ))}
+                {turns.map((turn, i) =>
+                  turn.notice ? (
+                    <DecisionNotice key={i} text={turn.progress.reply} />
+                  ) : (
+                    <div key={i} className="space-y-4">
+                      <p className="bg-primary text-primary-foreground ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2">
+                        {turn.question}
+                      </p>
+                      <Answer
+                        progress={turn.progress}
+                        useTools={useTools}
+                        agent={turn.agent ?? "copper"}
+                      />
+                    </div>
+                  ),
+                )}
                 {!busy && (
                   <div className="space-y-2">
                     {turns.length === 0 && (
@@ -292,6 +337,42 @@ export function AskCopper({
         </SheetContent>
       </Sheet>
     </>
+  );
+}
+
+/**
+ * Notices can put two agent messages in a row, or before the customer's
+ * first question. Models expect the customer to speak first and the two
+ * sides to take turns, so drop leading agent messages and join neighbors.
+ */
+function tidyHistory(messages: ChatMessage[]): ChatMessage[] {
+  const start = messages.findIndex((m) => m.role === "user");
+  return messages.slice(start).reduce<ChatMessage[]>((tidy, message) => {
+    const last = tidy.at(-1);
+    if (last?.role === message.role)
+      tidy[tidy.length - 1] = {
+        ...last,
+        content: `${last.content}\n\n${message.content}`,
+      };
+    else tidy.push(message);
+    return tidy;
+  }, []);
+}
+
+/** The Refund agent telling the customer what a person decided. */
+function DecisionNotice({ text }: { text: string }) {
+  return (
+    <div
+      data-testid="decision-notice"
+      role="status"
+      className="bg-card ml-2 rounded-2xl rounded-tl-sm border p-4 shadow-xs"
+    >
+      <p className="text-primary mb-1 text-xs font-bold">Refund agent</p>
+      <p className="text-muted-foreground mb-2 text-[11px] font-semibold tracking-widest uppercase">
+        Update from the Refund Console
+      </p>
+      <p className="text-sm">{text}</p>
+    </div>
   );
 }
 

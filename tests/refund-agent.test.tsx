@@ -3,6 +3,7 @@
 // model and a fake refund store, so they need no AI key, no database and cost
 // nothing. The refund rules themselves are tested in refunds.test.ts.
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -19,6 +20,7 @@ import {
   type Step,
   toolCallsOf,
 } from "@/lib/copper/assistant/progress";
+import { REFUND_DECIDED, type RefundDecision } from "@/lib/copper/refunds";
 import {
   createFakeRefundStore,
   type FakeRefundStore,
@@ -429,5 +431,87 @@ describe("The chat panel", () => {
       useTools: true,
       agent: "refund",
     });
+  });
+
+  it("tells the customer when a person approves or rejects in the console, without calling the AI", async () => {
+    const askCopper = vi
+      .fn()
+      .mockResolvedValue(answered({ agent: "refund", reply: "Okay." }));
+    vi.doMock("@/lib/copper/assistant/ask", () => ({ askCopper }));
+    const chat = await renderSupport();
+    await ask(chat, "Refund orders 1003 and 1004 please");
+    await waitFor(() => expect(chat.getByText("Okay.")).toBeVisible());
+    askCopper.mockClear();
+
+    const decide = (detail: RefundDecision) =>
+      act(async () => {
+        window.dispatchEvent(new CustomEvent(REFUND_DECIDED, { detail }));
+      });
+    await decide({
+      orderId: 1003,
+      item: "Copper Notes",
+      amountUsd: 129,
+      decision: "rejected",
+    });
+    const notice = chat.getByTestId("decision-notice");
+    expect(notice).toHaveTextContent("Refund agent");
+    expect(notice).toHaveTextContent(
+      "rejected it, so this order won't be refunded",
+    );
+    expect(notice).toHaveTextContent("order #1003 (Copper Notes, $129)");
+    expect(askCopper).not.toHaveBeenCalled();
+
+    await decide({
+      orderId: 1004,
+      item: "Copper Home",
+      amountUsd: 149,
+      decision: "approved",
+    });
+    expect(chat.getAllByTestId("decision-notice")[1]).toHaveTextContent(
+      "It has been refunded",
+    );
+
+    // The next question goes to the Refund agent, and the notices are part
+    // of the conversation it sees, joined to its last reply so the customer
+    // and the agent still take turns.
+    await ask(chat, "Why was the Notes one rejected?");
+    await waitFor(() => expect(askCopper).toHaveBeenCalledTimes(1));
+    const request = askCopper.mock.calls[0][0];
+    expect(request.agent).toBe("refund");
+    expect(request.messages).toEqual([
+      { role: "user", content: "Refund orders 1003 and 1004 please" },
+      {
+        role: "assistant",
+        content: expect.stringMatching(
+          /^Okay\.\n\n[^\n]*#1003[^\n]*\n\n[^\n]*#1004/,
+        ),
+      },
+      { role: "user", content: "Why was the Notes one rejected?" },
+    ]);
+  });
+
+  it("never starts the conversation with an agent message", async () => {
+    const askCopper = vi
+      .fn()
+      .mockResolvedValue(answered({ agent: "refund", reply: "Okay." }));
+    vi.doMock("@/lib/copper/assistant/ask", () => ({ askCopper }));
+    const chat = await renderSupport();
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent(REFUND_DECIDED, {
+          detail: {
+            orderId: 1004,
+            item: "Copper Home",
+            amountUsd: 149,
+            decision: "approved",
+          },
+        }),
+      );
+    });
+    await ask(chat, "Thanks!");
+    await waitFor(() => expect(askCopper).toHaveBeenCalledTimes(1));
+    expect(askCopper.mock.calls[0][0].messages).toEqual([
+      { role: "user", content: "Thanks!" },
+    ]);
   });
 });

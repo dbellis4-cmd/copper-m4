@@ -12,6 +12,8 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   consoleView,
+  decisionNotice,
+  REFUND_DECIDED,
   REFUNDS_CHANGED,
   requestRefund,
 } from "@/lib/copper/refunds";
@@ -36,6 +38,30 @@ afterEach(() => {
 });
 
 const fake = () => store as FakeRefundStore;
+
+describe("decisionNotice", () => {
+  it("tells the customer an approved refund was refunded, and a rejected one wasn't", () => {
+    const approved = decisionNotice({
+      orderId: 1004,
+      item: "Copper Home",
+      amountUsd: 149,
+      decision: "approved",
+    });
+    expect(approved).toContain("order #1004 (Copper Home, $149)");
+    expect(approved).toMatch(/approved/);
+    expect(approved).toMatch(/has been refunded/);
+
+    const rejected = decisionNotice({
+      orderId: 1001,
+      item: "Copper Plus, monthly",
+      amountUsd: 7.99,
+      decision: "rejected",
+    });
+    expect(rejected).toContain("order #1001 (Copper Plus, monthly, $7.99)");
+    expect(rejected).toMatch(/rejected/);
+    expect(rejected).toMatch(/won't be refunded/);
+  });
+});
 
 describe("consoleView", () => {
   it("lists the demo customer's orders with status, and the refunds waiting", async () => {
@@ -141,7 +167,9 @@ describe("The Refund Console page", () => {
     expect(screen.getAllByTestId("order")).toHaveLength(4);
   });
 
-  it("A3: a waiting refund can be approved, and its order shows Approved", async () => {
+  it("A3: a waiting refund can be approved: its order shows refunded, and the chat is told", async () => {
+    const decided = vi.fn();
+    window.addEventListener(REFUND_DECIDED, decided);
     await requestRefund(fake(), 1004);
     await renderConsole();
     const row = screen.getByTestId("waiting-refund");
@@ -156,10 +184,20 @@ describe("The Refund Console page", () => {
       slow,
     );
     const order = screen.getAllByTestId("order")[3];
-    expect(within(order).getByText("Approved")).toBeInTheDocument();
+    expect(within(order).getByText("Approved · Refunded")).toBeInTheDocument();
+    expect(decided).toHaveBeenCalledTimes(1);
+    expect((decided.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      orderId: 1004,
+      item: "Copper Home",
+      amountUsd: 149,
+      decision: "approved",
+    });
+    window.removeEventListener(REFUND_DECIDED, decided);
   });
 
-  it("A4: Reject marks it rejected", async () => {
+  it("A4: Reject marks it not refunded, and the chat is told", async () => {
+    const decided = vi.fn();
+    window.addEventListener(REFUND_DECIDED, decided);
     await requestRefund(fake(), 1003);
     await renderConsole();
     fireEvent.click(
@@ -168,10 +206,38 @@ describe("The Refund Console page", () => {
     await waitFor(
       () =>
         expect(
-          within(screen.getAllByTestId("order")[2]).getByText("Rejected"),
+          within(screen.getAllByTestId("order")[2]).getByText(
+            "Rejected · Not refunded",
+          ),
         ).toBeInTheDocument(),
       slow,
     );
+    expect((decided.mock.calls[0][0] as CustomEvent).detail).toMatchObject({
+      orderId: 1003,
+      decision: "rejected",
+    });
+    window.removeEventListener(REFUND_DECIDED, decided);
+  });
+
+  it("doesn't tell the chat when a refund was already decided", async () => {
+    const decided = vi.fn();
+    window.addEventListener(REFUND_DECIDED, decided);
+    await requestRefund(fake(), 1003);
+    await renderConsole();
+    // Someone else decides it first, in another tab.
+    await fake().decideRefund(fake().refunds[0].id, "approved");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Reject refund for order 1003" }),
+    );
+    await waitFor(
+      () =>
+        expect(
+          screen.getByText("That refund was already decided."),
+        ).toBeInTheDocument(),
+      slow,
+    );
+    expect(decided).not.toHaveBeenCalled();
+    window.removeEventListener(REFUND_DECIDED, decided);
   });
 
   it("A7: setting the limit to $0 says every refund needs approval", async () => {
