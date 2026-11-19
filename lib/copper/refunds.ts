@@ -30,8 +30,8 @@ export const STATUS_LABELS: Record<RefundStatus | "paid", string> = {
   paid: "Paid",
   refunded_auto: "Refunded automatically",
   waiting: "Waiting for approval",
-  approved: "Approved",
-  rejected: "Rejected",
+  approved: "Approved · Refunded",
+  rejected: "Rejected · Not refunded",
 };
 
 export type Refund = {
@@ -318,3 +318,36 @@ export async function consoleView(store: RefundStore): Promise<ConsoleView> {
  * Console on the same page reloads and shows the change.
  */
 export const REFUNDS_CHANGED = "copper:refunds-changed";
+
+/**
+ * The browser event the Refund Console fires after a person approves or
+ * rejects a refund, so the chat beside it can tell the customer.
+ */
+export const REFUND_DECIDED = "copper:refund-decided";
+
+export type RefundDecision = {
+  orderId: number;
+  item: string;
+  amountUsd: number;
+  decision: "approved" | "rejected";
+};
+
+/**
+ * What the Refund agent tells the customer after a person decides. Written
+ * by code from the database's answer (not by the model), so it's always
+ * accurate and costs no AI request.
+ */
+export function decisionNotice({
+  orderId,
+  item,
+  amountUsd,
+  decision,
+}: RefundDecision): string {
+  const amount = Number.isInteger(amountUsd)
+    ? `$${amountUsd}`
+    : `$${amountUsd.toFixed(2)}`;
+  const order = `order #${orderId} (${item}, ${amount})`;
+  return decision === "approved"
+    ? `Good news: a person on the Copper team approved your refund for ${order}. It has been refunded, and the money is on its way back to your original payment method.`
+    : `Update: a person on the Copper team reviewed your refund for ${order} and rejected it, so this order won't be refunded. If you have questions, the Copper Crew can help in the Copper app (Settings > Help).`;
+}

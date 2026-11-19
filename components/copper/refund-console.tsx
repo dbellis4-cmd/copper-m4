@@ -32,7 +32,12 @@ import {
   resetDemo,
   saveLimit,
 } from "@/lib/copper/refund-console";
-import { REFUNDS_CHANGED } from "@/lib/copper/refunds";
+import {
+  REFUND_DECIDED,
+  type RefundDecision,
+  REFUNDS_CHANGED,
+  type WaitingRefund,
+} from "@/lib/copper/refunds";
 
 export function RefundConsole() {
   const [result, setResult] = useState<ConsoleResult | null>(null);
@@ -72,6 +77,28 @@ export function RefundConsole() {
   /** A button's change: saved, then the page shows the result. */
   const change = (action: () => Promise<ConsoleResult>) =>
     run(action, { change: true });
+
+  /**
+   * Approve or Reject. Once the database confirms it, tell the chat beside
+   * the console, so the Refund agent can let the customer know.
+   */
+  const decide = (
+    refund: WaitingRefund,
+    decision: RefundDecision["decision"],
+  ) =>
+    change(async () => {
+      const result = await decideRefund(refund.refundId, decision);
+      if (result.status === "ok" && !result.message) {
+        const detail: RefundDecision = {
+          orderId: refund.orderId,
+          item: refund.item,
+          amountUsd: refund.amountUsd,
+          decision,
+        };
+        window.dispatchEvent(new CustomEvent(REFUND_DECIDED, { detail }));
+      }
+      return result;
+    });
 
   // Load on open, when the chat makes a refund, and when the tab comes back
   // into view (someone may have decided a refund in another tab).
@@ -195,9 +222,7 @@ export function RefundConsole() {
                     size="sm"
                     disabled={pending}
                     aria-label={`Approve refund for order ${refund.orderId}`}
-                    onClick={() =>
-                      change(() => decideRefund(refund.refundId, "approved"))
-                    }
+                    onClick={() => decide(refund, "approved")}
                   >
                     Approve
                   </Button>
@@ -206,9 +231,7 @@ export function RefundConsole() {
                     variant="destructive"
                     disabled={pending}
                     aria-label={`Reject refund for order ${refund.orderId}`}
-                    onClick={() =>
-                      change(() => decideRefund(refund.refundId, "rejected"))
-                    }
+                    onClick={() => decide(refund, "rejected")}
                   >
                     Reject
                   </Button>
